@@ -18,6 +18,7 @@ from audio.processor import AudioProcessor
 from pose.pose_binding import PoseBinding
 from pose.detector import PoseDetector
 from pose.types import PoseData
+from render import Renderer, Camera
 
 # 配置日志格式
 logging.basicConfig(
@@ -200,32 +201,90 @@ def capture_initial():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 def generate_frames():
-    """生成视频流"""
+    """生成视频帧"""
     while True:
+        if not camera_manager.is_running:
+            time.sleep(0.1)
+            continue
+            
+        frame = camera_manager.read_frame()
+        if frame is None:
+            continue
+            
+        # 转换颜色空间
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
         try:
-            # 读取帧
-            frame = camera_manager.read_frame()
-            if frame is None:
-                continue
-                
-            # 处理帧
-            result = pose_sender.process_and_send(frame)
-            if result is None:
-                result = frame
-                
-            # 编码帧
-            ret, buffer = cv2.imencode('.jpg', result)
+            # 处理姿态
+            pose_results = pose.process(frame_rgb)
+            # 处理手部
+            hands_results = hands.process(frame_rgb)
+            # 处理面部
+            face_results = face_mesh.process(frame_rgb)
+            
+            # 合并所有关键点数据
+            landmarks_data = {
+                'pose': [],
+                'face': [],
+                'left_hand': [],
+                'right_hand': []
+            }
+            
+            # 添加姿态关键点
+            if pose_results.pose_landmarks:
+                for landmark in pose_results.pose_landmarks.landmark:
+                    landmarks_data['pose'].append({
+                        'x': landmark.x,
+                        'y': landmark.y,
+                        'z': landmark.z,
+                        'visibility': landmark.visibility
+                    })
+            
+            # 添加面部关键点
+            if face_results.multi_face_landmarks:
+                for landmark in face_results.multi_face_landmarks[0].landmark:
+                    landmarks_data['face'].append({
+                        'x': landmark.x,
+                        'y': landmark.y,
+                        'z': landmark.z
+                    })
+            
+            # 添加手部关键点
+            if hands_results.multi_hand_landmarks:
+                for hand_idx, hand_landmarks in enumerate(hands_results.multi_hand_landmarks):
+                    # 确定是左手还是右手
+                    handedness = hands_results.multi_handedness[hand_idx].classification[0].label
+                    hand_type = 'left_hand' if handedness == 'Left' else 'right_hand'
+                    
+                    for landmark in hand_landmarks.landmark:
+                        landmarks_data[hand_type].append({
+                            'x': landmark.x,
+                            'y': landmark.y,
+                            'z': landmark.z
+                        })
+            
+            # 发送所有关键点数据
+            if any(landmarks_data.values()):
+                socketio.emit('pose_data', landmarks_data)
+                logger.info(f"发送关键点数据: 姿态={len(landmarks_data['pose'])}, "
+                          f"面部={len(landmarks_data['face'])}, "
+                          f"左手={len(landmarks_data['left_hand'])}, "
+                          f"右手={len(landmarks_data['right_hand'])} 个关键点")
+            
+        except Exception as e:
+            logger.error(f"处理关键点时出错: {str(e)}")
+            continue
+            
+        # 转换帧格式用于传输
+        try:
+            ret, buffer = cv2.imencode('.jpg', frame)  # 直接使用原始帧
             if not ret:
                 continue
-                
-            # 生成字节流
             frame_bytes = buffer.tobytes()
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-                   
         except Exception as e:
-            logger.error(f"生成帧失败: {e}")
-            time.sleep(0.1)
+            logger.error(f"编码帧时出错: {str(e)}")
 
 @app.route('/camera_status')
 def camera_status():
@@ -349,31 +408,15 @@ def get_status():
         return jsonify({'error': str(e)}), 500
 
 def main():
-    """主函数"""
+    renderer = Renderer(width=800, height=600)
+    camera = Camera()
+    
     try:
-        # 启动服务器
-        logger.info(f"服务器启动在 http://localhost:5000")
-        logger.info(f"模板目录: {app.template_folder}")
-        logger.info(f"静态文件目录: {app.static_folder}")
-        
-        socketio.run(app, host='0.0.0.0', port=5000, debug=True)
-        
-    except Exception as e:
-        logger.error(f"服务器错误: {e}")
-        
+        while True:
+            if not renderer.render():
+                break
     finally:
-        # 清理资源
-        camera_manager.release()
-        pose_sender.release()
+        renderer.cleanup()
 
-if __name__ == '__main__':
-    try:
-        # 确保必要的目录存在
-        os.makedirs('static', exist_ok=True)
-        os.makedirs('templates', exist_ok=True)
-        os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-        
-        main()
-    except Exception as e:
-        logger.error(f"服务器启动失败: {str(e)}")
-        sys.exit(1)
+if __name__ == "__main__":
+    main()
